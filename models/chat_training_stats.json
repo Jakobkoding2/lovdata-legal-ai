@@ -1,0 +1,12 @@
+{
+  "total_qa_pairs": 1700,
+  "content_qa_pairs": 1500,
+  "overlap_qa_pairs": 200,
+  "unique_documents": 243,
+  "question_types": {
+    "direct_content": 500,
+    "summary": 500,
+    "semantic_search": 500,
+    "overlap_analysis": 200
+  }
+}

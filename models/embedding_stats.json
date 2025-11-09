@@ -1,0 +1,11 @@
+{
+  "total_high_similarity_pairs": 15160,
+  "cross_group_overlaps": 0,
+  "potential_duplicates": 322,
+  "law_regulation_overlaps": 0,
+  "avg_similarity": 0.7841007113613995,
+  "max_similarity": 1.000091791152954,
+  "embedding_model": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+  "embedding_dimension": 384,
+  "total_vectors": 20000
+}

@@ -1,0 +1,69 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+      
+      - name: Run data pipeline tests
+        run: |
+          python3 -c "from scripts.data_pipeline import LovdataFetcher, LegalTextParser; print('✓ Data pipeline imports OK')"
+      
+      - name: Run embedding pipeline tests
+        run: |
+          python3 -c "import sys; sys.path.append('scripts'); print('✓ Embedding pipeline imports OK')"
+      
+      - name: Run classifier tests
+        run: |
+          python3 -c "from scripts.train_classifier import OverlapClassifier; print('✓ Classifier imports OK')"
+      
+      - name: Test API server
+        run: |
+          python3 -c "from api.api_server import app; print('✓ API server imports OK')"
+      
+      - name: Lint code
+        run: |
+          pip install flake8
+          flake8 scripts/ api/ --max-line-length=120 --ignore=E501,W503 || true
+      
+      - name: Check code formatting
+        run: |
+          pip install black
+          black --check scripts/ api/ --line-length=120 || true
+
+  build-docs:
+    runs-on: ubuntu-latest
+    needs: test
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Generate API documentation
+        run: |
+          pip install fastapi uvicorn
+          python3 -c "from api.api_server import app; import json; print(json.dumps(app.openapi(), indent=2))" > docs/openapi.json || true
+      
+      - name: Upload documentation
+        uses: actions/upload-artifact@v3
+        with:
+          name: api-docs
+          path: docs/

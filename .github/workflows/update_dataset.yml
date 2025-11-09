@@ -1,0 +1,66 @@
+name: Update Lovdata Dataset
+
+on:
+  schedule:
+    # Run every Sunday at 02:00 UTC
+    - cron: '0 2 * * 0'
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  update-dataset:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+      
+      - name: Run data pipeline
+        run: |
+          python3 scripts/data_pipeline.py
+      
+      - name: Run embedding pipeline
+        run: |
+          python3 scripts/embedding_pipeline_optimized.py
+      
+      - name: Train overlap classifier
+        run: |
+          python3 scripts/train_classifier.py
+      
+      - name: Generate training data
+        run: |
+          python3 scripts/train_chat.py
+      
+      - name: Commit and push changes
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add data/processed/*.parquet data/processed/*.jsonl models/*.json
+          git commit -m "chore: update dataset and models [automated]" || echo "No changes to commit"
+          git push
+      
+      - name: Create release
+        if: success()
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: dataset-${{ github.run_number }}
+          release_name: Dataset Update ${{ github.run_number }}
+          body: |
+            Automated weekly dataset update
+            
+            - Updated Lovdata legal corpus
+            - Regenerated embeddings and FAISS index
+            - Retrained overlap classifier
+            - Updated training data
+          draft: false
+          prerelease: false

@@ -1,0 +1,10 @@
+{
+  "total_units": 338311,
+  "groups": {
+    "regulation": 264310,
+    "law": 74001
+  },
+  "avg_text_length": 231.23562343524154,
+  "total_documents": 4193,
+  "avg_words_per_unit": 33.33990618099914
+}
