@@ -1,5 +1,4 @@
 version: "3.9"
-
 services:
   backend:
     build: .
@@ -9,3 +8,6 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - MODEL_PROVIDER=openai
       - MODEL_NAME=gpt-5-mini
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      MODEL_PROVIDER: ${MODEL_PROVIDER:-openai}
+      MODEL_NAME: ${MODEL_NAME:-gpt-5-mini}
