@@ -416,4 +416,4 @@ async def get_statistics() -> Dict[str, Dict]:
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("api.api_server:app", host="0.0.0.0", port=8000, reload=False)
