@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import os
 import sys
 from pathlib import Path
@@ -16,11 +17,14 @@ from api.rag_pipeline import (  # noqa: E402
     ChunkRecord,
     compute_overlap,
 )
+from openai import OpenAI
 
 BASE_DIR = Path(__file__).parent.parent
 DATA_DIR = BASE_DIR / "data"
 PROCESSED_DIR = DATA_DIR / "processed"
 MODELS_DIR = BASE_DIR / "models"
+
+DEFAULT_MODEL_NAME = "gpt-5-mini"
 
 app = FastAPI(
     title="Lovdata Legal AI API",
@@ -38,6 +42,27 @@ app.add_middleware(
 
 rag_pipeline: Optional[CodexRAGPipeline] = None
 overlap_classifier = None
+
+
+def _resolve_model_name() -> str:
+    return os.getenv("MODEL_NAME", DEFAULT_MODEL_NAME)
+
+
+def _build_openai_client() -> OpenAI:
+    try:
+        api_key = os.environ["OPENAI_API_KEY"]
+    except KeyError as exc:  # pragma: no cover - configuration error
+        raise HTTPException(
+            status_code=401,
+            detail="OPENAI_API_KEY environment variable is required for answering legal questions.",
+        ) from exc
+
+    client_kwargs: Dict[str, str] = {"api_key": api_key}
+    base_url = os.getenv("MODEL_PROVIDER")
+    if base_url and base_url.startswith("http"):
+        client_kwargs["base_url"] = base_url
+
+    return OpenAI(**client_kwargs)
 
 
 class SearchRequest(BaseModel):
@@ -121,6 +146,11 @@ async def root() -> Dict[str, str]:
         "version": "2.0.0",
         "docs": "/docs",
     }
+
+
+@app.get("/healthz")
+async def healthz() -> Dict[str, object]:
+    return {"ok": True, "model": _resolve_model_name()}
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -253,49 +283,110 @@ async def ask_legal_question(request: QARequest) -> QAResponse:
 
 
 async def generate_answer(question: str, contexts: List[ChunkRecord]) -> str:
-    from openai import OpenAI
+    source_map: Dict[str, ChunkRecord] = {}
+    context_sections: List[str] = []
 
-    context_strings = [
-        f"{record.doc_title} § {record.section_num or 'N/A'}: {record.text}" for record in contexts
-    ]
-    context_block = "\n\n".join(context_strings)
+    for idx, record in enumerate(contexts, start=1):
+        source_id = f"S{idx}"
+        source_map[source_id] = record
+        header = (
+            f"{source_id} | doc_id={record.doc_id} | tittel={record.doc_title} | "
+            f"paragraf={record.section_num or 'ukjent'}"
+        )
+        context_sections.append(f"{header}\n{record.text}")
 
-    messages = [
-        {
-            "role": "system",
-            "content": "Du er en ekspert på norsk lov. Svar presist og basert på den gitte konteksten.",
+    context_block = "\n\n".join(context_sections)
+
+    system_prompt = (
+        "Du er en ekspert på norsk lov. Gi presise svar basert på konteksten. "
+        "Returner JSON med feltene 'answer' og 'citations'. 'citations' skal være en liste med objekter "
+        "som minst inneholder 'source_id' som peker til kildene (S1, S2, ...). Legg til valgfri 'snippet' "
+        "med korte begrunnelser. Ikke bruk andre kilder enn de oppgitte."
+    )
+
+    user_prompt = (
+        f"Kontekst:\n{context_block}\n\nSpørsmål: {question}\n\n"
+        "Svar konsist på norsk og referer til relevante kilder via 'citations'."
+    )
+
+    response_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "legal_answer",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "answer": {"type": "string"},
+                    "citations": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "source_id": {"type": "string"},
+                                "snippet": {"type": "string"},
+                            },
+                            "required": ["source_id"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["answer", "citations"],
+                "additionalProperties": False,
+            },
         },
-        {
-            "role": "user",
-            "content": f"Kontekst:\n{context_block}\n\nSpørsmål: {question}\n\nSvar på norsk med tydelige referanser til relevante paragrafer.",
-        },
-    ]
+    }
 
     try:
-        client = OpenAI()
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            max_tokens=800,
+        client = _build_openai_client()
+        response = client.responses.create(
+            model=_resolve_model_name(),
+            input=[
+                {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
+                {"role": "user", "content": [{"type": "text", "text": user_prompt}]},
+            ],
             temperature=0.2,
+            max_output_tokens=800,
+            response_format=response_format,
         )
-        return response.choices[0].message.content
-    except Exception:
-        fallback_key = os.getenv("TOGETHER_API_KEY")
-        if fallback_key:
-            try:
-                fallback_client = OpenAI(api_key=fallback_key, base_url="https://api.together.xyz/v1")
-                response = fallback_client.chat.completions.create(
-                    model="meta-llama/Meta-Llama-3-8B-Instruct",
-                    messages=messages,
-                    max_tokens=800,
-                    temperature=0.2,
-                )
-                return response.choices[0].message.content
-            except Exception:
-                pass
+    except HTTPException:
+        raise
+    except Exception as exc:  # pragma: no cover - network failure
+        raise HTTPException(status_code=502, detail=f"LLM request failed: {exc}") from exc
 
-    return "Kunne ikke generere svar basert på tilgjengelige modeller. Vennligst prøv igjen senere."
+    output_text = getattr(response, "output_text", "").strip()
+
+    try:
+        parsed = json.loads(output_text)
+    except json.JSONDecodeError as exc:  # pragma: no cover - unexpected model response
+        raise HTTPException(status_code=502, detail="LLM returned malformed JSON response.") from exc
+
+    answer_text = str(parsed.get("answer", "")).strip()
+    citations = parsed.get("citations", []) or []
+
+    citation_lines: List[str] = []
+    for citation in citations:
+        source_id = citation.get("source_id")
+        if not isinstance(source_id, str):
+            continue
+        record = source_map.get(source_id)
+        if record is None:
+            continue
+        label = record.doc_title or record.doc_id
+        if record.section_num:
+            label = f"{label} § {record.section_num}"
+        snippet = citation.get("snippet")
+        line = f"- {label} ({record.doc_id})"
+        if isinstance(snippet, str) and snippet.strip():
+            line = f"{line}: {snippet.strip()}"
+        citation_lines.append(line)
+
+    if citation_lines:
+        answer_text = f"{answer_text}\n\nKilder:\n" + "\n".join(citation_lines)
+
+    if not answer_text:
+        raise HTTPException(status_code=502, detail="LLM returned empty answer.")
+
+    return answer_text
 
 
 @app.get("/stats")
@@ -325,4 +416,4 @@ async def get_statistics() -> Dict[str, Dict]:
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("api.api_server:app", host="0.0.0.0", port=8000, reload=False)

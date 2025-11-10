@@ -1,14 +1,11 @@
 version: "3.9"
 
 services:
-  api:
+  backend:
     build: .
-    env_file:
-      - .env
-    environment:
-      - TOGETHER_API_KEY=${TOGETHER_API_KEY:-}
     ports:
       - "8000:8000"
-    volumes:
-      - ./:/app
-    command: uvicorn api.api_server:app --host 0.0.0.0 --port 8000
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - MODEL_PROVIDER=openai
+      - MODEL_NAME=gpt-5-mini
