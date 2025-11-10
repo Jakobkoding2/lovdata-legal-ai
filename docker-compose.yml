@@ -3,10 +3,11 @@ version: "3.9"
 services:
   api:
     build: .
-    env_file:
-      - .env
     environment:
-      - TOGETHER_API_KEY=${TOGETHER_API_KEY:-}
+      # Required at runtime; set via GitHub Secrets or docker run
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?OPENAI_API_KEY must be set}
+      MODEL_PROVIDER: ${MODEL_PROVIDER:-}
+      MODEL_NAME: ${MODEL_NAME:-gpt-5-mini}
     ports:
       - "8000:8000"
     volumes:
