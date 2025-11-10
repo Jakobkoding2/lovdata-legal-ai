@@ -106,6 +106,17 @@ python3 api_server.py
 
 The API will be available at `http://localhost:8000`.
 
+### Configuring the Gradio Client
+
+The Gradio UI defined in `app.py` targets `http://localhost:8000` by default. When deploying the
+backend remotely (for example on Render), set the `API_URL` environment variable before launching
+the UI so that requests are routed to the hosted FastAPI service:
+
+```bash
+export API_URL="https://your-backend-service.onrender.com"
+python app.py
+```
+
 ### Endpoints
 
 -   **`POST /search`**: Performs semantic search over the legal corpus.

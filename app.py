@@ -1,7 +1,19 @@
+import os
+
 import gradio as gr
 import requests
 
-API_URL = "http://localhost:8000"
+
+def _resolve_api_url() -> str:
+    """Return the backend base URL, defaulting to localhost for local dev."""
+
+    base_url = os.getenv("API_URL") or os.getenv("BACKEND_URL")
+    if not base_url:
+        return "http://localhost:8000"
+    return base_url.rstrip("/")
+
+
+API_URL = _resolve_api_url()
 
 
 def search_law(query: str, top_k: int):
