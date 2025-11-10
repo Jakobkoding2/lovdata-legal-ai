@@ -40,13 +40,12 @@ This guide provides step-by-step instructions for deploying the Lovdata Legal AI
     pip install -r requirements.txt
     ```
 
-4.  **Run the data pipeline (optional - pre-processed data is included):**
+4.  **Build the retrieval assets (first run only):**
 
     ```bash
     python3 scripts/data_pipeline.py
-    python3 scripts/embedding_pipeline_optimized.py
-    python3 scripts/train_classifier.py
-    python3 scripts/train_chat.py
+    python3 scripts/chunk_pipeline.py
+    python3 scripts/embed_pipeline.py
     ```
 
 5.  **Start the API server:**
@@ -117,6 +116,8 @@ services:
       - ./models:/app/models
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - MODEL_NAME=${MODEL_NAME:-gpt-5-mini}
+      - MODEL_PROVIDER=${MODEL_PROVIDER:-openai}
     restart: unless-stopped
 ```
 
@@ -205,8 +206,8 @@ docker-compose up -d
 3.  **Upload embeddings and index:**
 
     ```bash
-    huggingface-cli upload lovdata-legal-ai models/lovdata_embeddings.npy
-    huggingface-cli upload lovdata-legal-ai models/lovdata_faiss.index
+    huggingface-cli upload lovdata-legal-ai models/codex_rag_embeddings.npy
+    huggingface-cli upload lovdata-legal-ai models/codex_rag_hnsw.index
     huggingface-cli upload lovdata-legal-ai models/overlap_classifier.joblib
     ```
 

@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 import json
+import logging
 import os
 import sys
+import time
 from pathlib import Path
-from typing import List, Dict, Optional
+from threading import Lock
+from typing import Dict, List, Optional
 
 import numpy as np
 from fastapi import FastAPI, HTTPException
@@ -12,24 +15,22 @@ from pydantic import BaseModel, Field
 
 sys.path.append(str(Path(__file__).parent.parent))
 
-from api.rag_pipeline import (  # noqa: E402
-    CodexRAGPipeline,
-    ChunkRecord,
-    compute_overlap,
-)
+from api.rag_pipeline import CodexRAGPipeline, ChunkRecord, compute_overlap  # noqa: E402
+from lovdata_rag.bootstrap import ensure_assets_ready  # noqa: E402
+from lovdata_rag.config import MODELS_DIR  # noqa: E402
+from lovdata_rag.ft import resolve_active_model  # noqa: E402
 from openai import OpenAI
 
-BASE_DIR = Path(__file__).parent.parent
-DATA_DIR = BASE_DIR / "data"
-PROCESSED_DIR = DATA_DIR / "processed"
-MODELS_DIR = BASE_DIR / "models"
-
 DEFAULT_MODEL_NAME = "gpt-5-mini"
+FALLBACK_MODEL_NAME = "gpt-4o-mini"
+
+logger = logging.getLogger("lovdata_rag.api")
+logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(
     title="Lovdata Legal AI API",
-    description="Semantic search and Q&A for Norwegian legal texts",
-    version="2.0.0",
+    description="Hybrid RAG pipeline for Norwegian laws and forskrifter",
+    version="3.0.0",
 )
 
 app.add_middleware(
@@ -40,35 +41,57 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+class MetricsCollector:
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._counts = {"search": 0, "ask_law": 0, "detect_overlap": 0}
+        self._latency: Dict[str, List[float]] = {key: [] for key in self._counts}
+
+    def record(self, endpoint: str, latency: float) -> None:
+        with self._lock:
+            if endpoint in self._counts:
+                self._counts[endpoint] += 1
+                self._latency[endpoint].append(latency)
+
+    def snapshot(self) -> Dict[str, Dict[str, float]]:
+        with self._lock:
+            return {
+                "counts": dict(self._counts),
+                "latency_ms": {
+                    key: (sum(values) / len(values) * 1000 if values else 0.0)
+                    for key, values in self._latency.items()
+                },
+            }
+
+
+metrics = MetricsCollector()
 rag_pipeline: Optional[CodexRAGPipeline] = None
 overlap_classifier = None
 
 
 def _resolve_model_name() -> str:
-    return os.getenv("MODEL_NAME", DEFAULT_MODEL_NAME)
+    return resolve_active_model(DEFAULT_MODEL_NAME, FALLBACK_MODEL_NAME)
 
 
 def _build_openai_client() -> OpenAI:
-    try:
-        api_key = os.environ["OPENAI_API_KEY"]
-    except KeyError as exc:  # pragma: no cover - configuration error
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
         raise HTTPException(
             status_code=401,
-            detail="OPENAI_API_KEY environment variable is required for answering legal questions.",
-        ) from exc
-
+            detail="OPENAI_API_KEY must be set to call language models.",
+        )
     client_kwargs: Dict[str, str] = {"api_key": api_key}
     base_url = os.getenv("MODEL_PROVIDER")
     if base_url and base_url.startswith("http"):
         client_kwargs["base_url"] = base_url
-
     return OpenAI(**client_kwargs)
 
 
 class SearchRequest(BaseModel):
-    query: str = Field(..., description="Search query text")
-    top_k: int = Field(10, ge=1, le=100, description="Number of results to return")
-    min_similarity: float = Field(0.0, ge=0.0, le=1.0, description="Minimum similarity threshold")
+    query: str
+    top_k: int = Field(10, ge=1, le=50)
+    min_similarity: float = Field(0.0, ge=0.0, le=1.0)
     filter_group: Optional[str] = Field(None, description="Filter by 'law' or 'regulation'")
 
 
@@ -76,9 +99,16 @@ class SearchResult(BaseModel):
     doc_id: str
     doc_title: str
     section_num: Optional[str]
+    section_title: Optional[str]
+    kapittel: Optional[str]
+    ledd: Optional[str]
     text: str
     similarity: float
     group: str
+    date: Optional[str]
+    source_url: Optional[str]
+    start_char: Optional[int]
+    end_char: Optional[int]
 
 
 class SearchResponse(BaseModel):
@@ -88,8 +118,8 @@ class SearchResponse(BaseModel):
 
 
 class OverlapRequest(BaseModel):
-    text1: str = Field(..., description="First legal text")
-    text2: str = Field(..., description="Second legal text")
+    text1: str
+    text2: str
 
 
 class OverlapResponse(BaseModel):
@@ -100,8 +130,8 @@ class OverlapResponse(BaseModel):
 
 
 class QARequest(BaseModel):
-    question: str = Field(..., description="Legal question in Norwegian")
-    context_size: int = Field(5, ge=1, le=10, description="Number of context paragraphs")
+    question: str
+    context_size: int = Field(5, ge=1, le=10)
 
 
 class QAResponse(BaseModel):
@@ -120,73 +150,56 @@ class HealthResponse(BaseModel):
 @app.on_event("startup")
 async def load_models() -> None:
     global rag_pipeline, overlap_classifier
-    print("Loading Codex RAG pipeline...")
-    try:
-        rag_pipeline = CodexRAGPipeline(BASE_DIR)
-        print("✓ Codex RAG pipeline loaded")
-    except Exception as exc:  # pragma: no cover
-        print(f"ERROR: Failed to load Codex RAG pipeline: {exc}")
-        rag_pipeline = None
-
+    ensure_assets_ready()
+    logger.info("Loading RAG pipeline")
+    rag_pipeline = CodexRAGPipeline()
     classifier_path = MODELS_DIR / "overlap_classifier.joblib"
     if classifier_path.exists():
         import joblib
 
         overlap_classifier = joblib.load(classifier_path)
-        print("✓ Loaded overlap classifier")
+        logger.info("Overlap classifier loaded")
     else:
         overlap_classifier = None
-        print(f"WARNING: Overlap classifier not found at {classifier_path}")
+        logger.warning("Overlap classifier missing at %s", classifier_path)
 
 
-@app.get("/", response_model=Dict[str, str])
+@app.get("/")
 async def root() -> Dict[str, str]:
-    return {
-        "message": "Lovdata Legal AI API",
-        "version": "2.0.0",
-        "docs": "/docs",
-    }
+    return {"message": "Lovdata Legal AI API", "docs": "/docs"}
 
 
 @app.get("/healthz")
 async def healthz() -> Dict[str, object]:
-    return {"ok": True, "model": _resolve_model_name()}
+    return {"ok": rag_pipeline is not None, "model": _resolve_model_name()}
 
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check() -> HealthResponse:
     models_loaded = {
         "rag_pipeline": rag_pipeline is not None,
-        "faiss_index": getattr(rag_pipeline, "faiss_index", None) is not None,
-        "bm25": getattr(rag_pipeline, "bm25", None) is not None,
-        "embedder": getattr(rag_pipeline, "embedding_model", None) is not None,
-        "reranker": getattr(rag_pipeline, "cross_encoder", None) is not None,
+        "faiss_index": bool(getattr(rag_pipeline, "faiss_index", None)),
+        "bm25": bool(getattr(rag_pipeline, "bm25", None)),
+        "embedder": bool(getattr(rag_pipeline, "embedding_model", None)),
         "overlap_classifier": overlap_classifier is not None,
     }
-
-    corpus_size = 0
-    index_size = 0
-    if rag_pipeline is not None:
-        corpus_size = len(rag_pipeline.chunk_df)
-        index_size = rag_pipeline.faiss_index.ntotal if rag_pipeline.faiss_index is not None else 0
-
-    return HealthResponse(
-        status="healthy" if models_loaded["rag_pipeline"] else "degraded",
-        models_loaded=models_loaded,
-        corpus_size=corpus_size,
-        index_size=index_size,
+    corpus_size = len(rag_pipeline.chunk_df) if rag_pipeline else 0
+    index_size = (
+        rag_pipeline.faiss_index.ntotal if rag_pipeline and rag_pipeline.faiss_index is not None else 0
     )
+    status = "healthy" if models_loaded["rag_pipeline"] else "degraded"
+    return HealthResponse(status=status, models_loaded=models_loaded, corpus_size=corpus_size, index_size=index_size)
 
 
 @app.post("/search", response_model=SearchResponse)
-async def semantic_search(request: SearchRequest) -> SearchResponse:
+async def search(request: SearchRequest) -> SearchResponse:
+    start = time.perf_counter()
     if rag_pipeline is None or rag_pipeline.faiss_index is None:
         raise HTTPException(status_code=503, detail="Models not loaded")
-
     candidates = rag_pipeline.search(request.query, max(request.top_k, rag_pipeline.rerank_top_k))
     results: List[SearchResult] = []
     for record in candidates:
-        if request.filter_group and record.group != request.filter_group:
+        if request.filter_group and record.group.lower() != request.filter_group.lower():
             continue
         if record.score < request.min_similarity:
             continue
@@ -195,24 +208,31 @@ async def semantic_search(request: SearchRequest) -> SearchResponse:
                 doc_id=record.doc_id,
                 doc_title=record.doc_title,
                 section_num=record.section_num,
+                section_title=record.section_title,
+                kapittel=record.kapittel,
+                ledd=record.ledd,
                 text=record.text[:500],
                 similarity=float(record.score),
                 group=record.group,
+                date=record.date,
+                source_url=record.source_url,
+                start_char=record.start_char,
+                end_char=record.end_char,
             )
         )
         if len(results) >= request.top_k:
             break
-
+    metrics.record("search", time.perf_counter() - start)
     return SearchResponse(query=request.query, results=results, total_results=len(results))
 
 
 @app.post("/detect_overlap", response_model=OverlapResponse)
-async def detect_overlap(request: OverlapRequest) -> OverlapResponse:
+async def detect_overlap_endpoint(request: OverlapRequest) -> OverlapResponse:
+    start = time.perf_counter()
     if rag_pipeline is None or rag_pipeline.embedding_model is None or overlap_classifier is None:
         raise HTTPException(status_code=503, detail="Models not loaded")
 
     similarity = compute_overlap(rag_pipeline.embedding_model, request.text1, request.text2)
-
     len1 = len(request.text1)
     len2 = len(request.text2)
     words1 = set(request.text1.lower().split())
@@ -220,9 +240,9 @@ async def detect_overlap(request: OverlapRequest) -> OverlapResponse:
 
     features = {
         "similarity": similarity,
-        "len_ratio": min(len1, len2) / max(len1, len2) if max(len1, len2) > 0 else 0,
+        "len_ratio": min(len1, len2) / max(len1, len2) if max(len1, len2) else 0,
         "len_diff": abs(len1 - len2),
-        "word_overlap": len(words1 & words2) / len(words1 | words2) if len(words1 | words2) > 0 else 0,
+        "word_overlap": len(words1 & words2) / len(words1 | words2) if words1 or words2 else 0,
         "same_doc": 0,
         "cross_group": 0,
         "avg_length": (len1 + len2) / 2,
@@ -233,59 +253,55 @@ async def detect_overlap(request: OverlapRequest) -> OverlapResponse:
     classifier = overlap_classifier["classifier"]
     feature_names = overlap_classifier["feature_names"]
     X = np.array([[features[col] for col in feature_names]])
-
     prediction = classifier.predict(X)[0]
     probabilities = classifier.predict_proba(X)[0]
     prob_dict = dict(zip(classifier.classes_, [float(p) for p in probabilities]))
 
-    if prediction == "duplicate":
-        explanation = "Tekstene er nesten identiske. Dette kan indikere duplikasjon."
-    elif prediction == "subsumption":
-        explanation = "En tekst inneholder eller impliserer den andre. Dette kan indikere subsumpsjon."
-    elif prediction == "delegation":
-        explanation = "Tekstene viser til hverandre eller har delegasjonsforhold."
-    else:
-        explanation = "Tekstene er semantisk forskjellige."
-
-    return OverlapResponse(
-        overlap_type=prediction,
-        similarity=similarity,
-        probabilities=prob_dict,
-        explanation=explanation,
-    )
+    explanations = {
+        "duplicate": "Tekstene er nesten identiske og indikerer duplisering.",
+        "subsumption": "En tekst innlemmer den andre og kan tyde pa subsumsjon.",
+        "delegation": "Tekstene peker til hverandre eller fordeler ansvar.",
+    }
+    explanation = explanations.get(prediction, "Tekstene er semantisk ulike.")
+    metrics.record("detect_overlap", time.perf_counter() - start)
+    return OverlapResponse(overlap_type=prediction, similarity=similarity, probabilities=prob_dict, explanation=explanation)
 
 
 @app.post("/ask_law", response_model=QAResponse)
-async def ask_legal_question(request: QARequest) -> QAResponse:
+async def ask_law(request: QARequest) -> QAResponse:
+    start = time.perf_counter()
     if rag_pipeline is None or rag_pipeline.faiss_index is None:
         raise HTTPException(status_code=503, detail="Models not loaded")
-
     contexts = rag_pipeline.top_contexts(request.question)
-    if not contexts:
-        raise HTTPException(status_code=404, detail="Ingen relevant lovtekst funnet")
-
+    if not contexts or contexts[0].score < 0.2:
+        metrics.record("ask_law", time.perf_counter() - start)
+        raise HTTPException(status_code=404, detail="Ingen tilstrekkelig dokumentasjon funnet.")
     answer = await generate_answer(request.question, contexts)
-
-    sources: List[SearchResult] = []
-    for record in contexts[: request.context_size]:
-        sources.append(
-            SearchResult(
-                doc_id=record.doc_id,
-                doc_title=record.doc_title,
-                section_num=record.section_num,
-                text=record.text[:500],
-                similarity=float(record.score),
-                group=record.group,
-            )
+    sources = [
+        SearchResult(
+            doc_id=record.doc_id,
+            doc_title=record.doc_title,
+            section_num=record.section_num,
+            section_title=record.section_title,
+            kapittel=record.kapittel,
+            ledd=record.ledd,
+            text=record.text[:500],
+            similarity=float(record.score),
+            group=record.group,
+            date=record.date,
+            source_url=record.source_url,
+            start_char=record.start_char,
+            end_char=record.end_char,
         )
-
+        for record in contexts[: request.context_size]
+    ]
+    metrics.record("ask_law", time.perf_counter() - start)
     return QAResponse(question=request.question, answer=answer, sources=sources)
 
 
 async def generate_answer(question: str, contexts: List[ChunkRecord]) -> str:
     source_map: Dict[str, ChunkRecord] = {}
-    context_sections: List[str] = []
-
+    sections: List[str] = []
     for idx, record in enumerate(contexts, start=1):
         source_id = f"S{idx}"
         source_map[source_id] = record
@@ -293,22 +309,14 @@ async def generate_answer(question: str, contexts: List[ChunkRecord]) -> str:
             f"{source_id} | doc_id={record.doc_id} | tittel={record.doc_title} | "
             f"paragraf={record.section_num or 'ukjent'}"
         )
-        context_sections.append(f"{header}\n{record.text}")
-
-    context_block = "\n\n".join(context_sections)
-
+        sections.append(f"{header}\n{record.text}")
+    context_block = "\n\n".join(sections)
     system_prompt = (
-        "Du er en ekspert på norsk lov. Gi presise svar basert på konteksten. "
-        "Returner JSON med feltene 'answer' og 'citations'. 'citations' skal være en liste med objekter "
-        "som minst inneholder 'source_id' som peker til kildene (S1, S2, ...). Legg til valgfri 'snippet' "
-        "med korte begrunnelser. Ikke bruk andre kilder enn de oppgitte."
+        "Du er en ekspert pa norsk lov. Gi presise svar basert pa konteksten. "
+        "Returner JSON med feltene 'answer' og 'citations'. 'citations' skal vere en liste med objekter "
+        "som minst inneholder 'source_id' (S1, S2, ...). Legg til valgfri 'snippet'."
     )
-
-    user_prompt = (
-        f"Kontekst:\n{context_block}\n\nSpørsmål: {question}\n\n"
-        "Svar konsist på norsk og referer til relevante kilder via 'citations'."
-    )
-
+    user_prompt = f"Kontekst:\n{context_block}\n\nSporsmal: {question}\n\nSvar med tydelige sitater."
     response_format = {
         "type": "json_schema",
         "json_schema": {
@@ -335,7 +343,6 @@ async def generate_answer(question: str, contexts: List[ChunkRecord]) -> str:
             },
         },
     }
-
     try:
         client = _build_openai_client()
         response = client.responses.create(
@@ -350,67 +357,52 @@ async def generate_answer(question: str, contexts: List[ChunkRecord]) -> str:
         )
     except HTTPException:
         raise
-    except Exception as exc:  # pragma: no cover - network failure
+    except Exception as exc:  # pragma: no cover
+        logger.error("LLM request failed: %s", exc)
         raise HTTPException(status_code=502, detail=f"LLM request failed: {exc}") from exc
 
     output_text = getattr(response, "output_text", "").strip()
-
     try:
         parsed = json.loads(output_text)
-    except json.JSONDecodeError as exc:  # pragma: no cover - unexpected model response
-        raise HTTPException(status_code=502, detail="LLM returned malformed JSON response.") from exc
+    except json.JSONDecodeError as exc:  # pragma: no cover
+        raise HTTPException(status_code=502, detail="LLM returned malformed JSON.") from exc
 
     answer_text = str(parsed.get("answer", "")).strip()
-    citations = parsed.get("citations", []) or []
-
     citation_lines: List[str] = []
-    for citation in citations:
+    for citation in parsed.get("citations", []) or []:
         source_id = citation.get("source_id")
-        if not isinstance(source_id, str):
-            continue
         record = source_map.get(source_id)
-        if record is None:
+        if not record:
             continue
         label = record.doc_title or record.doc_id
         if record.section_num:
             label = f"{label} § {record.section_num}"
-        snippet = citation.get("snippet")
+        snippet = citation.get("snippet", "")
         line = f"- {label} ({record.doc_id})"
-        if isinstance(snippet, str) and snippet.strip():
+        if snippet:
             line = f"{line}: {snippet.strip()}"
         citation_lines.append(line)
 
     if citation_lines:
         answer_text = f"{answer_text}\n\nKilder:\n" + "\n".join(citation_lines)
-
     if not answer_text:
         raise HTTPException(status_code=502, detail="LLM returned empty answer.")
-
     return answer_text
 
 
 @app.get("/stats")
-async def get_statistics() -> Dict[str, Dict]:
-    stats: Dict[str, Dict] = {}
-
-    if rag_pipeline is not None:
-        stats["corpus"] = {
-            "total_chunks": len(rag_pipeline.chunk_df),
-            "unique_documents": int(rag_pipeline.chunk_df["doc_id"].nunique()) if not rag_pipeline.chunk_df.empty else 0,
-        }
-        if rag_pipeline.embeddings is not None:
-            stats["embeddings"] = {
-                "shape": rag_pipeline.embeddings.shape,
-                "dimension": int(rag_pipeline.embeddings.shape[1]) if rag_pipeline.embeddings.size else 0,
-                "dtype": str(rag_pipeline.embeddings.dtype),
-            }
+async def stats() -> Dict[str, Dict]:
+    payload: Dict[str, Dict] = {}
+    if rag_pipeline:
+        payload["corpus"] = {"total_chunks": len(rag_pipeline.chunk_df)}
         if rag_pipeline.faiss_index is not None:
-            stats["index"] = {
-                "total_vectors": int(rag_pipeline.faiss_index.ntotal),
-                "efSearch": getattr(rag_pipeline.faiss_index.hnsw, "efSearch", None),
-            }
+            payload["index"] = {"total_vectors": int(rag_pipeline.faiss_index.ntotal)}
+    return payload
 
-    return stats
+
+@app.get("/metrics")
+async def metrics_endpoint() -> Dict[str, Dict[str, float]]:
+    return metrics.snapshot()
 
 
 if __name__ == "__main__":

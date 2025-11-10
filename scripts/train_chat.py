@@ -51,7 +51,7 @@ class LegalQADatasetGenerator:
     def _generate_questions_for_text(self, row: pd.Series) -> List[Dict]:
         """Generate multiple question types for a single legal text"""
         
-        text = row['text_clean']
+        text = row['text']
         doc_title = row['doc_title']
         section_num = row.get('section_num', 'N/A')
         group = row['group']

@@ -50,8 +50,8 @@ class OverlapClassifier:
             similarity = row['similarity']
             
             # Get text data
-            text1 = corpus_df.iloc[idx1]['text_clean']
-            text2 = corpus_df.iloc[idx2]['text_clean']
+            text1 = corpus_df.iloc[idx1]['text']
+            text2 = corpus_df.iloc[idx2]['text']
             
             # Extract features
             features = self._extract_features(text1, text2, similarity, row)
