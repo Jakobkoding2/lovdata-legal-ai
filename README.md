@@ -137,6 +137,8 @@ The API will be available at `http://localhost:8000`.
     }
     ```
 
+-   **`GET /healthz`**: Lightweight health probe that reports the active model name.
+
 ## Automation
 
 The repository includes a GitHub Actions workflow (`.github/workflows/update_dataset.yml`) designed to run weekly. This workflow automatically re-runs the entire pipeline to fetch the latest legal data, retrain the models, and commit the updated assets to the repository.
