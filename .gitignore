@@ -40,7 +40,6 @@ models/*.index
 logs/
 
 # Environment
-.env
 .venv
 
 # IDE
