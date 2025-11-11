@@ -1,4 +1,4 @@
-> **Note**: This project was developed by an autonomous AI agent.
+
 
 # Autonomous AI System for Norwegian Legal Tech
 
