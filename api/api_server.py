@@ -19,6 +19,7 @@ from api.rag_pipeline import CodexRAGPipeline, ChunkRecord, compute_overlap  # n
 from lovdata_rag.bootstrap import ensure_assets_ready  # noqa: E402
 from lovdata_rag.config import MODELS_DIR  # noqa: E402
 from lovdata_rag.ft import resolve_active_model  # noqa: E402
+from contextlib import asynccontextmanager
 from openai import OpenAI
 
 DEFAULT_MODEL_NAME = "gpt-5-mini"
@@ -27,10 +28,17 @@ FALLBACK_MODEL_NAME = "gpt-4o-mini"
 logger = logging.getLogger("lovdata_rag.api")
 logging.basicConfig(level=logging.INFO)
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await load_models()
+    yield
+
+
 app = FastAPI(
     title="Lovdata Legal AI API",
     description="Hybrid RAG pipeline for Norwegian laws and forskrifter",
     version="3.0.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -147,7 +155,6 @@ class HealthResponse(BaseModel):
     index_size: int
 
 
-@app.on_event("startup")
 async def load_models() -> None:
     global rag_pipeline, overlap_classifier
     ensure_assets_ready()
